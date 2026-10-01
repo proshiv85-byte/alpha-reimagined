@@ -1,0 +1,25 @@
+# Ignore everything by default; only the source, patches, launcher and docs
+# are part of the repository. Builds are published as GitHub releases.
+/*
+!/.gitignore
+!/README.md
+
+# Launcher (single-file executable wrapper) and its build script
+!/launcher/
+/launcher/*
+!/launcher/build.sh
+!/launcher/src/
+
+# Patched, decompiled sources and the patches against vanilla
+!/retromcp/
+/retromcp/*
+!/retromcp/minecraft/
+/retromcp/minecraft/*
+!/retromcp/minecraft/src/
+!/retromcp/minecraft_server/
+/retromcp/minecraft_server/*
+!/retromcp/minecraft_server/src/
+!/retromcp/patches/
+
+# Generated during builds
+/launcher/src/stub/payload-*.zip

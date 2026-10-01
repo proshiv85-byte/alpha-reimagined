@@ -1,0 +1,1101 @@
+--- net/minecraft/src/World.java
++++ net/minecraft/src/World.java
+@@ -54,6 +54,7 @@
+ 	private int soundCounter;
+ 	private List entitiesWithinAABBExcludingEntity;
+ 	public boolean multiplayerWorld;
++	public boolean skinsDisabled = false;
+ 
+ 	public static NBTTagCompound getLevelData(File var0, String var1) {
+ 		File var2 = new File(var0, "saves");
+@@ -378,7 +379,7 @@
+ 		}
+ 	}
+ 
+-	private boolean chunkExists(int var1, int var2) {
++	protected boolean chunkExists(int var1, int var2) {
+ 		return this.chunkProvider.chunkExists(var1, var2);
+ 	}
+ 
+--- net/minecraft/src/EntityArrow.java
++++ net/minecraft/src/EntityArrow.java
+@@ -91,7 +91,7 @@
+ 		}
+ 
+ 		Entity var4 = null;
+-		List var5 = this.worldObj.getEntitiesWithinAABBExcludingEntity(this, this.boundingBox.addCoord(this.motionX, this.motionY, this.motionZ).expand(1.0D, 1.0D, 1.0D));
++		List var5 = this.worldObj.multiplayerWorld ? new java.util.ArrayList() : this.worldObj.getEntitiesWithinAABBExcludingEntity(this, this.boundingBox.addCoord(this.motionX, this.motionY, this.motionZ).expand(1.0D, 1.0D, 1.0D));
+ 		double var6 = 0.0D;
+ 
+ 		float var10;
+--- net/minecraft/src/EntityFallingSand.java
++++ net/minecraft/src/EntityFallingSand.java
+@@ -53,10 +53,10 @@
+ 				this.motionZ *= (double)0.7F;
+ 				this.motionY *= -0.5D;
+ 				this.setEntityDead();
+-				if(!this.worldObj.canBlockBePlacedAt(this.blockID, var1, var2, var3, true) || !this.worldObj.setBlockWithNotify(var1, var2, var3, this.blockID)) {
++				if(!this.worldObj.multiplayerWorld && (!this.worldObj.canBlockBePlacedAt(this.blockID, var1, var2, var3, true) || !this.worldObj.setBlockWithNotify(var1, var2, var3, this.blockID))) {
+ 					this.dropItem(this.blockID, 1);
+ 				}
+-			} else if(this.fallTime > 100) {
++			} else if(this.fallTime > 100 && !this.worldObj.multiplayerWorld) {
+ 				this.dropItem(this.blockID, 1);
+ 				this.setEntityDead();
+ 			}
+--- net/minecraft/src/TileEntityFurnace.java
++++ net/minecraft/src/TileEntityFurnace.java
+@@ -1,6 +1,7 @@
+ package net.minecraft.src;
+ 
+ public class TileEntityFurnace extends TileEntity implements IInventory {
++	private int syncRevision = 0;
+ 	private ItemStack[] furnaceItemStacks = new ItemStack[3];
+ 	private int furnaceBurnTime = 0;
+ 	private int currentItemBurnTime = 0;
+@@ -48,6 +49,7 @@
+ 
+ 	public void readFromNBT(NBTTagCompound var1) {
+ 		super.readFromNBT(var1);
++		this.syncRevision = var1.getInteger("Rev");
+ 		NBTTagList var2 = var1.getTagList("Items");
+ 		this.furnaceItemStacks = new ItemStack[this.getSizeInventory()];
+ 
+@@ -60,12 +62,19 @@
+ 		}
+ 
+ 		this.furnaceBurnTime = var1.getShort("BurnTime");
+-		this.furnaceCookTime = var1.getShort("CookTime");
++		short var6 = var1.getShort("CookTime");
++		// In multiplayer the arrow is advanced locally between server updates. If
++		// the server is lagging behind, don't make the arrow jump backwards; a
++		// real reset (new item or nothing to smelt) still comes through.
++		if(this.worldObj == null || !this.worldObj.multiplayerWorld || var6 == 0 || var6 >= this.furnaceCookTime || this.furnaceCookTime - var6 > 100) {
++			this.furnaceCookTime = var6;
++		}
+ 		this.currentItemBurnTime = this.getItemBurnTime(this.furnaceItemStacks[1]);
+ 	}
+ 
+ 	public void writeToNBT(NBTTagCompound var1) {
+ 		super.writeToNBT(var1);
++		var1.setInteger("Rev", this.syncRevision);
+ 		var1.setShort("BurnTime", (short)this.furnaceBurnTime);
+ 		var1.setShort("CookTime", (short)this.furnaceCookTime);
+ 		NBTTagList var2 = new NBTTagList();
+@@ -107,6 +116,16 @@
+ 		boolean var2 = false;
+ 		if(this.furnaceBurnTime > 0) {
+ 			--this.furnaceBurnTime;
++		}
++
++		if(this.worldObj.multiplayerWorld) {
++			// The server does the smelting and sends progress every second;
++			// advance the arrow locally in between so it moves smoothly.
++			if(!this.canSmelt()) {
++				this.furnaceCookTime = 0;
++			} else if(this.isBurning() && this.furnaceCookTime < 199) {
++				++this.furnaceCookTime;
++			}
+ 		}
+ 
+ 		if(!this.worldObj.multiplayerWorld) {
+--- /dev/null
++++ net/minecraft/src/Packet60Explosion.java
+@@ -1,0 +1,76 @@
++package net.minecraft.src;
++
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++import java.util.ArrayList;
++import java.util.Iterator;
++import java.util.List;
++import java.util.Set;
++
++public class Packet60Explosion extends Packet {
++	public double explosionX;
++	public double explosionY;
++	public double explosionZ;
++	public float explosionSize;
++	public List destroyedBlockPositions;
++
++	public Packet60Explosion() {
++	}
++
++	public Packet60Explosion(double var1, double var3, double var5, float var7, Set var8) {
++		this.explosionX = var1;
++		this.explosionY = var3;
++		this.explosionZ = var5;
++		this.explosionSize = var7;
++		this.destroyedBlockPositions = new ArrayList(var8);
++	}
++
++	public void readPacketData(DataInputStream var1) throws IOException {
++		this.explosionX = var1.readDouble();
++		this.explosionY = var1.readDouble();
++		this.explosionZ = var1.readDouble();
++		this.explosionSize = var1.readFloat();
++		int var2 = var1.readInt();
++		this.destroyedBlockPositions = new ArrayList(var2);
++		int var3 = (int)this.explosionX;
++		int var4 = (int)this.explosionY;
++		int var5 = (int)this.explosionZ;
++
++		for(int var6 = 0; var6 < var2; ++var6) {
++			int var7 = var1.readByte() + var3;
++			int var8 = var1.readByte() + var4;
++			int var9 = var1.readByte() + var5;
++			this.destroyedBlockPositions.add(new ChunkPosition(var7, var8, var9));
++		}
++
++	}
++
++	public void writePacket(DataOutputStream var1) throws IOException {
++		var1.writeDouble(this.explosionX);
++		var1.writeDouble(this.explosionY);
++		var1.writeDouble(this.explosionZ);
++		var1.writeFloat(this.explosionSize);
++		var1.writeInt(this.destroyedBlockPositions.size());
++		int var2 = (int)this.explosionX;
++		int var3 = (int)this.explosionY;
++		int var4 = (int)this.explosionZ;
++		Iterator var5 = this.destroyedBlockPositions.iterator();
++
++		while(var5.hasNext()) {
++			ChunkPosition var6 = (ChunkPosition)var5.next();
++			var1.writeByte(var6.x - var2);
++			var1.writeByte(var6.y - var3);
++			var1.writeByte(var6.z - var4);
++		}
++
++	}
++
++	public void processPacket(NetHandler var1) {
++		var1.handleExplosion(this);
++	}
++
++	public int getPacketSize() {
++		return 32 + this.destroyedBlockPositions.size() * 3;
++	}
++}
+--- net/minecraft/src/EntitySnowball.java
++++ net/minecraft/src/EntitySnowball.java
+@@ -98,7 +98,7 @@
+ 		}
+ 
+ 		Entity var4 = null;
+-		List var5 = this.worldObj.getEntitiesWithinAABBExcludingEntity(this, this.boundingBox.addCoord(this.motionX, this.motionY, this.motionZ).expand(1.0D, 1.0D, 1.0D));
++		List var5 = this.worldObj.multiplayerWorld ? new java.util.ArrayList() : this.worldObj.getEntitiesWithinAABBExcludingEntity(this, this.boundingBox.addCoord(this.motionX, this.motionY, this.motionZ).expand(1.0D, 1.0D, 1.0D));
+ 		double var6 = 0.0D;
+ 
+ 		int var8;
+--- net/minecraft/src/EntityList.java
++++ net/minecraft/src/EntityList.java
+@@ -94,8 +94,8 @@
+ 		addMapping(EntitySlime.class, "Slime", 55);
+ 		addMapping(EntityPig.class, "Pig", 90);
+ 		addMapping(EntitySheep.class, "Sheep", 91);
+-		addMapping(EntityCow.class, "Cow", 91);
+-		addMapping(EntityChicken.class, "Chicken", 91);
++		addMapping(EntityCow.class, "Cow", 92);
++		addMapping(EntityChicken.class, "Chicken", 93);
+ 		addMapping(EntityTNTPrimed.class, "PrimedTnt", 20);
+ 		addMapping(EntityFallingSand.class, "FallingSand", 21);
+ 		addMapping(EntityMinecart.class, "Minecart", 40);
+--- net/minecraft/src/Explosion.java
++++ net/minecraft/src/Explosion.java
+@@ -127,4 +127,30 @@
+ 		}
+ 
+ 	}
++
++	public void doExplosionEffects(World var1, double var2, double var4, double var6, float var8, List var9) {
++		var1.playSoundEffect(var2, var4, var6, "random.explode", 4.0F, (1.0F + (var1.rand.nextFloat() - var1.rand.nextFloat()) * 0.2F) * 0.7F);
++
++		for(int var10 = var9.size() - 1; var10 >= 0; --var10) {
++			ChunkPosition var11 = (ChunkPosition)var9.get(var10);
++			double var12 = (double)((float)var11.x + var1.rand.nextFloat());
++			double var14 = (double)((float)var11.y + var1.rand.nextFloat());
++			double var16 = (double)((float)var11.z + var1.rand.nextFloat());
++			double var18 = var12 - var2;
++			double var20 = var14 - var4;
++			double var22 = var16 - var6;
++			double var24 = (double)MathHelper.sqrt_double(var18 * var18 + var20 * var20 + var22 * var22);
++			var18 /= var24;
++			var20 /= var24;
++			var22 /= var24;
++			double var26 = 0.5D / (var24 / (double)var8 + 0.1D);
++			var26 *= (double)(var1.rand.nextFloat() * var1.rand.nextFloat() + 0.3F);
++			var18 *= var26;
++			var20 *= var26;
++			var22 *= var26;
++			var1.spawnParticle("explode", (var12 + var2 * 1.0D) / 2.0D, (var14 + var4 * 1.0D) / 2.0D, (var16 + var6 * 1.0D) / 2.0D, var18, var20, var22);
++			var1.spawnParticle("smoke", var12, var14, var16, var18, var20, var22);
++		}
++
++	}
+ }
+--- net/minecraft/src/RenderLiving.java
++++ net/minecraft/src/RenderLiving.java
+@@ -54,7 +54,7 @@
+ 				var15 = 1.0F;
+ 			}
+ 
+-			this.loadDownloadableImageTexture(var1.skinUrl, var1.getTexture());
++			this.loadDownloadableImageTexture(var1.worldObj != null && var1.worldObj.skinsDisabled ? null : var1.skinUrl, var1.getTexture());
+ 			GL11.glEnable(GL11.GL_ALPHA_TEST);
+ 			this.mainModel.render(var16, var15, var13, var11 - var10, var12, var14);
+ 
+--- net/minecraft/src/WorldClient.java
++++ net/minecraft/src/WorldClient.java
+@@ -97,6 +97,13 @@
+ 	}
+ 
+ 	public boolean spawnEntityInWorld(Entity var1) {
++		// Items are owned by the server. Anything else trying to drop one here
++		// (a block or mob running single-player logic) would create a ghost item
++		// that only this client can see and nobody can pick up.
++		if(var1 instanceof EntityItem && this.entityHashTable.lookup(var1.entityID) != var1) {
++			return false;
++		}
++
+ 		boolean var2 = super.spawnEntityInWorld(var1);
+ 		if(var1 instanceof EntityPlayerSP) {
+ 			this.entityList.add(var1);
+@@ -123,19 +130,20 @@
+ 
+ 	protected void releaseEntitySkin(Entity var1) {
+ 		super.releaseEntitySkin(var1);
+-		if(this.entityList.contains(var1)) {
++		if(!var1.isDead && this.entityList.contains(var1)) {
+ 			this.entitySpawnQueue.add(var1);
+ 		}
+ 
+ 	}
+ 
+ 	public void addEntityToWorld(int var1, Entity var2) {
++		var2.entityID = var1;
++		this.entityHashTable.addKey(var1, var2);
+ 		this.entityList.add(var2);
+ 		if(!this.spawnEntityInWorld(var2)) {
+ 			this.entitySpawnQueue.add(var2);
+ 		}
+ 
+-		this.entityHashTable.addKey(var1, var2);
+ 	}
+ 
+ 	public Entity getEntityByID(int var1) {
+@@ -146,7 +154,21 @@
+ 		Entity var2 = (Entity)this.entityHashTable.removeObject(var1);
+ 		if(var2 != null) {
+ 			this.entityList.remove(var2);
++			this.entitySpawnQueue.remove(var2);
+ 			this.setEntityDead(var2);
++			// Remove it right away: the server may reuse this entity ID for a new
++			// entity (a respawned player) in the very next packet, and entities
++			// compare equal by ID.
++			for(int var3 = this.loadedEntityList.size() - 1; var3 >= 0; --var3) {
++				if(this.loadedEntityList.get(var3) == var2) {
++					this.loadedEntityList.remove(var3);
++					if(var2.addedToChunk && this.chunkExists(var2.chunkCoordX, var2.chunkCoordZ)) {
++						this.getChunkFromChunkCoords(var2.chunkCoordX, var2.chunkCoordZ).removeEntity(var2);
++					}
++
++					this.releaseEntitySkin(var2);
++				}
++			}
+ 		}
+ 
+ 		return var2;
+--- net/minecraft/src/Chunk.java
++++ net/minecraft/src/Chunk.java
+@@ -237,7 +237,7 @@
+ 			this.worldObj.scheduleLightingUpdate(EnumSkyBlock.Sky, var9, var2, var10, var9, var2, var10);
+ 			this.worldObj.scheduleLightingUpdate(EnumSkyBlock.Block, var9, var2, var10, var9, var2, var10);
+ 			this.updateSkylight_do(var1, var3);
+-			if(var4 != 0) {
++			if(var4 != 0 && !this.worldObj.multiplayerWorld) {
+ 				Block.blocksList[var4].onBlockAdded(this.worldObj, var9, var2, var10);
+ 			}
+ 
+--- net/minecraft/client/Minecraft.java
++++ net/minecraft/client/Minecraft.java
+@@ -23,6 +23,8 @@
+ import net.minecraft.src.GuiConnecting;
+ import net.minecraft.src.GuiErrorScreen;
+ import net.minecraft.src.GuiGameOver;
++import net.minecraft.src.EntityClientPlayerMP;
++import net.minecraft.src.PlayerControllerMP;
+ import net.minecraft.src.GuiIngame;
+ import net.minecraft.src.GuiIngameMenu;
+ import net.minecraft.src.GuiInventory;
+@@ -677,6 +679,10 @@
+ 				ItemStack var9 = this.thePlayer.inventory.getCurrentItem();
+ 				if(var9 != null) {
+ 					var3 = var9.stackSize;
++					if(this.playerController instanceof PlayerControllerMP) {
++						((PlayerControllerMP)this.playerController).sendUseItem(var9);
++					}
++
+ 					ItemStack var10 = var9.useItemRightClick(this.theWorld, this.thePlayer);
+ 					if(var10 != var9 || var10 != null && var10.stackSize != var3) {
+ 						this.thePlayer.inventory.mainInventory[this.thePlayer.inventory.currentItem] = var10;
+@@ -874,6 +880,10 @@
+ 													this.displayGuiScreen(new GuiInventory(this.thePlayer.inventory, this.thePlayer.inventory.craftingInventory));
+ 												}
+ 
++												if(Keyboard.getEventKey() == Keyboard.KEY_N && System.getProperty("alphar.debug") != null) {
++													this.thePlayer.toggleNoclip();
++												}
++
+ 												if(Keyboard.getEventKey() == this.options.keyBindDrop.keyCode) {
+ 													this.thePlayer.dropPlayerItemWithRandomChoice(this.thePlayer.inventory.decrStackSize(this.thePlayer.inventory.currentItem, 1), false);
+ 												}
+@@ -1112,6 +1122,19 @@
+ 	}
+ 
+ 	public void respawn() {
++		if(this.isMultiplayerWorld() && this.thePlayer instanceof EntityClientPlayerMP) {
++			int var1 = this.thePlayer.entityID;
++			((EntityClientPlayerMP)this.thePlayer).sendRespawnPacket();
++			this.theWorld.setEntityDead(this.thePlayer);
++			this.thePlayer = (EntityPlayerSP)this.playerController.createPlayer(this.theWorld);
++			this.thePlayer.entityID = var1;
++			this.thePlayer.preparePlayerToSpawn();
++			this.theWorld.spawnPlayerWithLoadedChunks(this.thePlayer);
++			this.thePlayer.movementInput = new MovementInputFromOptions(this.options);
++			this.playerController.onRespawn(this.thePlayer);
++			return;
++		}
++
+ 		this.theWorld.setSpawnLocation();
+ 		if(this.thePlayer != null) {
+ 			this.theWorld.setEntityDead(this.thePlayer);
+@@ -1140,7 +1163,7 @@
+ 		var5.pack();
+ 		var5.setLocationRelativeTo((Component)null);
+ 		MinecraftImpl var7 = new MinecraftImpl(var5, var6, (MinecraftApplet)null, 854, 480, var3, var5);
+-		Thread var8 = new Thread(var7, "Minecraft main thread");
++		Thread var8 = new Thread((ThreadGroup)null, var7, "Minecraft main thread", 64L * 1024L * 1024L);
+ 		var8.setPriority(10);
+ 		var7.appletMode = false;
+ 		var7.minecraftUri = "www.minecraft.net";
+--- net/minecraft/src/EntityPlayerSP.java
++++ net/minecraft/src/EntityPlayerSP.java
+@@ -3,6 +3,7 @@
+ import net.minecraft.client.Minecraft;
+ 
+ public class EntityPlayerSP extends EntityPlayer {
++	private boolean healthInitialized = false;
+ 	public MovementInput movementInput;
+ 	private Minecraft mc;
+ 
+@@ -24,7 +25,40 @@
+ 		this.isJumping = this.movementInput.jump;
+ 	}
+ 
++	public void toggleNoclip() {
++		this.noClip = !this.noClip;
++		this.motionX = this.motionY = this.motionZ = 0.0D;
++		this.fallDistance = 0.0F;
++		this.mc.ingameGUI.addChatMessage("\u00a77Noclip " + (this.noClip ? "on (Space up, Shift down)" : "off"));
++		if(this.worldObj.multiplayerWorld) {
++			this.sendChatMessage("/noclip " + (this.noClip ? "on" : "off"));
++		}
++
++	}
++
+ 	public void onLivingUpdate() {
++		if(this.noClip) {
++			// Test-build noclip: fly through blocks, no gravity.
++			this.movementInput.updatePlayerMoveState(this);
++			float var1 = this.movementInput.moveForward;
++			float var2 = this.movementInput.moveStrafe;
++			if(this.movementInput.sneak) {
++				var1 /= 0.3F;
++				var2 /= 0.3F;
++			}
++
++			double var3 = 0.6D;
++			float var5 = MathHelper.sin(this.rotationYaw * (float)Math.PI / 180.0F);
++			float var6 = MathHelper.cos(this.rotationYaw * (float)Math.PI / 180.0F);
++			this.motionX = (double)(var2 * var6 - var1 * var5) * var3;
++			this.motionZ = (double)(var1 * var6 + var2 * var5) * var3;
++			this.motionY = this.movementInput.jump ? var3 : (this.movementInput.sneak ? -var3 : 0.0D);
++			this.moveEntity(this.motionX, this.motionY, this.motionZ);
++			this.fallDistance = 0.0F;
++			this.ySize = 0.0F;
++			return;
++		}
++
+ 		this.movementInput.updatePlayerMoveState(this);
+ 		if(this.movementInput.sneak && this.ySize < 0.2F) {
+ 			this.ySize = 0.2F;
+@@ -113,5 +147,32 @@
+ 
+ 	public boolean isSneaking() {
+ 		return this.movementInput.sneak;
++	}
++
++	public void setHealth(int var1) {
++		int var2 = this.health - var1;
++		if(!this.healthInitialized) {
++			this.healthInitialized = true;
++			this.health = var1;
++		} else if(var2 <= 0) {
++			this.health = var1;
++			if(var2 < 0) {
++				this.heartsLife = this.heartsHalvesLife / 2;
++			}
++		} else {
++			this.inventory.damageArmor(var2);
++			this.prevHealth = this.health;
++			this.heartsLife = this.heartsHalvesLife;
++			this.health = var1;
++			this.hurtTime = this.maxHurtTime = 10;
++			this.attackedAtYaw = 0.0F;
++			if(this.health <= 0) {
++				this.worldObj.playSoundAtEntity(this, this.getDeathSound(), this.getSoundVolume(), (this.rand.nextFloat() - this.rand.nextFloat()) * 0.2F + 1.0F);
++				this.onDeath((Entity)null);
++			} else {
++				this.worldObj.playSoundAtEntity(this, this.getHurtSound(), this.getSoundVolume(), (this.rand.nextFloat() - this.rand.nextFloat()) * 0.2F + 1.0F);
++			}
++		}
++
+ 	}
+ }
+--- net/minecraft/src/Packet.java
++++ net/minecraft/src/Packet.java
+@@ -73,6 +73,9 @@
+ 		addIdClassMapping(4, Packet4UpdateTime.class);
+ 		addIdClassMapping(5, Packet5PlayerInventory.class);
+ 		addIdClassMapping(6, Packet6SpawnPosition.class);
++		addIdClassMapping(7, Packet7UseEntity.class);
++		addIdClassMapping(8, Packet8UpdateHealth.class);
++		addIdClassMapping(9, Packet9Respawn.class);
+ 		addIdClassMapping(10, Packet10Flying.class);
+ 		addIdClassMapping(11, Packet11PlayerPosition.class);
+ 		addIdClassMapping(12, Packet12PlayerLook.class);
+@@ -87,17 +90,21 @@
+ 		addIdClassMapping(22, Packet22Collect.class);
+ 		addIdClassMapping(23, Packet23VehicleSpawn.class);
+ 		addIdClassMapping(24, Packet24MobSpawn.class);
++		addIdClassMapping(28, Packet28EntityVelocity.class);
+ 		addIdClassMapping(29, Packet29DestroyEntity.class);
+ 		addIdClassMapping(30, Packet30Entity.class);
+ 		addIdClassMapping(31, Packet31RelEntityMove.class);
+ 		addIdClassMapping(32, Packet32EntityLook.class);
+ 		addIdClassMapping(33, Packet33RelEntityMoveLook.class);
+ 		addIdClassMapping(34, Packet34EntityTeleport.class);
++		addIdClassMapping(38, Packet38EntityStatus.class);
+ 		addIdClassMapping(50, Packet50PreChunk.class);
+ 		addIdClassMapping(51, Packet51MapChunk.class);
+ 		addIdClassMapping(52, Packet52MultiBlockChange.class);
+ 		addIdClassMapping(53, Packet53BlockChange.class);
+ 		addIdClassMapping(59, Packet59ComplexEntity.class);
++		addIdClassMapping(60, Packet60Explosion.class);
++		addIdClassMapping(70, Packet70ServerSetting.class);
+ 		addIdClassMapping(255, Packet255KickDisconnect.class);
+ 	}
+ }
+--- /dev/null
++++ net/minecraft/src/Packet9Respawn.java
+@@ -1,0 +1,21 @@
++package net.minecraft.src;
++
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++
++public class Packet9Respawn extends Packet {
++	public void readPacketData(DataInputStream var1) throws IOException {
++	}
++
++	public void writePacket(DataOutputStream var1) throws IOException {
++	}
++
++	public void processPacket(NetHandler var1) {
++		var1.handleRespawn(this);
++	}
++
++	public int getPacketSize() {
++		return 0;
++	}
++}
+--- net/minecraft/src/NetClientHandler.java
++++ net/minecraft/src/NetClientHandler.java
+@@ -35,6 +35,7 @@
+ 		this.worldClient = new WorldClient(this);
+ 		this.worldClient.multiplayerWorld = true;
+ 		this.mc.changeWorld1(this.worldClient);
++		this.mc.thePlayer.entityID = var1.protocolVersion;
+ 		this.mc.displayGuiScreen(new GuiDownloadTerrain(this));
+ 	}
+ 
+@@ -73,12 +74,35 @@
+ 			var8 = new EntityBoat(this.worldClient, var2, var4, var6);
+ 		}
+ 
++		if(var1.type == 60) {
++			var8 = new EntityArrow(this.worldClient);
++			((Entity)var8).setLocationAndAngles(var2, var4, var6, 0.0F, 0.0F);
++		}
++
++		if(var1.type == 61) {
++			var8 = new EntitySnowball(this.worldClient);
++			((Entity)var8).setLocationAndAngles(var2, var4, var6, 0.0F, 0.0F);
++		}
++
++		if(var1.type == 50) {
++			var8 = new EntityTNTPrimed(this.worldClient, (float)var2, (float)var4, (float)var6);
++		}
++
++		if(var1.type == 70) {
++			var8 = new EntityFallingSand(this.worldClient, (float)var2, (float)var4, (float)var6, Block.sand.blockID);
++		}
++
++		if(var1.type == 71) {
++			var8 = new EntityFallingSand(this.worldClient, (float)var2, (float)var4, (float)var6, Block.gravel.blockID);
++		}
++
+ 		if(var8 != null) {
+ 			((Entity)var8).serverPosX = var1.xPosition;
+ 			((Entity)var8).serverPosY = var1.yPosition;
+ 			((Entity)var8).serverPosZ = var1.zPosition;
+ 			((Entity)var8).rotationYaw = 0.0F;
+ 			((Entity)var8).rotationPitch = 0.0F;
++			((Entity)var8).motionX = ((Entity)var8).motionY = ((Entity)var8).motionZ = 0.0D;
+ 			((Entity)var8).entityID = var1.entityId;
+ 			this.worldClient.addEntityToWorld(var1.entityId, (Entity)var8);
+ 		}
+@@ -230,8 +254,8 @@
+ 	}
+ 
+ 	public void handleCollect(Packet22Collect var1) {
+-		EntityItem var2 = (EntityItem)this.worldClient.getEntityByID(var1.collectedEntityId);
+-		Object var3 = (EntityLiving)this.worldClient.getEntityByID(var1.collectorEntityId);
++		Entity var2 = this.worldClient.getEntityByID(var1.collectedEntityId);
++		Object var3 = (EntityLiving)this.getEntityByID(var1.collectorEntityId);
+ 		if(var3 == null) {
+ 			var3 = this.mc.thePlayer;
+ 		}
+@@ -276,7 +300,7 @@
+ 
+ 	public void handleHandshake(Packet2Handshake var1) {
+ 		if(var1.username.equals("-")) {
+-			this.addToSendQueue(new Packet1Login(this.mc.session.username, "Password", 2));
++			this.addToSendQueue(new Packet1Login(this.mc.session.username, "Password", 4));
+ 		} else {
+ 			try {
+ 				URL var2 = new URL("http://www.minecraft.net/game/joinserver.jsp?user=" + this.mc.session.username + "&sessionId=" + this.mc.session.sessionId + "&serverId=" + var1.username);
+@@ -284,7 +308,7 @@
+ 				String var4 = var3.readLine();
+ 				var3.close();
+ 				if(var4.equalsIgnoreCase("ok")) {
+-					this.addToSendQueue(new Packet1Login(this.mc.session.username, "Password", 2));
++					this.addToSendQueue(new Packet1Login(this.mc.session.username, "Password", 4));
+ 				} else {
+ 					this.netManager.networkShutdown("Failed to login: " + var4);
+ 				}
+@@ -349,5 +373,42 @@
+ 		this.worldClient.spawnX = var1.xPosition;
+ 		this.worldClient.spawnY = var1.yPosition;
+ 		this.worldClient.spawnZ = var1.zPosition;
++	}
++
++	private Entity getEntityByID(int var1) {
++		return this.mc.thePlayer != null && var1 == this.mc.thePlayer.entityID ? this.mc.thePlayer : this.worldClient.getEntityByID(var1);
++	}
++
++	public void handleUpdateHealth(Packet8UpdateHealth var1) {
++		this.mc.thePlayer.setHealth(var1.healthMP);
++	}
++
++	public void handleEntityStatus(Packet38EntityStatus var1) {
++		Entity var2 = this.getEntityByID(var1.entityId);
++		if(var2 instanceof EntityLiving && var2 != this.mc.thePlayer) {
++			((EntityLiving)var2).handleHealthUpdate(var1.entityStatus);
++		}
++
++	}
++
++	public void handleEntityVelocity(Packet28EntityVelocity var1) {
++		Entity var2 = this.getEntityByID(var1.entityId);
++		if(var2 != null) {
++			var2.motionX = (double)var1.motionX / 8000.0D;
++			var2.motionY = (double)var1.motionY / 8000.0D;
++			var2.motionZ = (double)var1.motionZ / 8000.0D;
++		}
++
++	}
++
++	public void handleExplosion(Packet60Explosion var1) {
++		(new Explosion()).doExplosionEffects(this.worldClient, var1.explosionX, var1.explosionY, var1.explosionZ, var1.explosionSize, var1.destroyedBlockPositions);
++	}
++
++	public void handleServerSetting(Packet70ServerSetting var1) {
++		if(var1.key.equals("skins") && this.worldClient != null) {
++			this.worldClient.skinsDisabled = var1.value.equals("off");
++		}
++
+ 	}
+ }
+--- net/minecraft/src/ItemBow.java
++++ net/minecraft/src/ItemBow.java
+@@ -9,7 +9,10 @@
+ 	public ItemStack onItemRightClick(ItemStack var1, World var2, EntityPlayer var3) {
+ 		if(var3.inventory.consumeInventoryItem(Item.arrow.shiftedIndex)) {
+ 			var2.playSoundAtEntity(var3, "random.bow", 1.0F, 1.0F / (rand.nextFloat() * 0.4F + 0.8F));
+-			var2.spawnEntityInWorld(new EntityArrow(var2, var3));
++			if(!var2.multiplayerWorld) {
++				var2.spawnEntityInWorld(new EntityArrow(var2, var3));
++			}
++
+ 		}
+ 
+ 		return var1;
+--- net/minecraft/src/PlayerControllerMP.java
++++ net/minecraft/src/PlayerControllerMP.java
+@@ -151,6 +151,11 @@
+ 		return super.onPlayerRightClick(var1, var2, var3, var4, var5, var6, var7);
+ 	}
+ 
++	public void sendUseItem(ItemStack var1) {
++		this.syncCurrentPlayItem();
++		this.netClientHandler.addToSendQueue(new Packet15Place(var1.itemID, -1, -1, -1, 255));
++	}
++
+ 	public EntityPlayer createPlayer(World var1) {
+ 		return new EntityClientPlayerMP(this.mc, var1, this.mc.session, this.netClientHandler);
+ 	}
+--- net/minecraft/src/EntityClientPlayerMP.java
++++ net/minecraft/src/EntityClientPlayerMP.java
+@@ -87,6 +87,15 @@
+ 		this.sendQueue.addToSendQueue(new Packet3Chat(var1));
+ 	}
+ 
++	public void attackEntity(Entity var1) {
++		this.sendQueue.addToSendQueue(new Packet7UseEntity(this.entityID, var1.entityID, 1));
++		super.attackEntity(var1);
++	}
++
++	public void sendRespawnPacket() {
++		this.sendQueue.addToSendQueue(new Packet9Respawn());
++	}
++
+ 	public void swingItem() {
+ 		super.swingItem();
+ 		this.sendQueue.addToSendQueue(new Packet18ArmAnimation(this, 1));
+--- /dev/null
++++ net/minecraft/src/Packet28EntityVelocity.java
+@@ -1,0 +1,73 @@
++package net.minecraft.src;
++
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++
++public class Packet28EntityVelocity extends Packet {
++	public int entityId;
++	public int motionX;
++	public int motionY;
++	public int motionZ;
++
++	public Packet28EntityVelocity() {
++	}
++
++	public Packet28EntityVelocity(Entity var1) {
++		this(var1.entityID, var1.motionX, var1.motionY, var1.motionZ);
++	}
++
++	public Packet28EntityVelocity(int var1, double var2, double var4, double var6) {
++		this.entityId = var1;
++		double var8 = 3.9D;
++		if(var2 < -var8) {
++			var2 = -var8;
++		}
++
++		if(var4 < -var8) {
++			var4 = -var8;
++		}
++
++		if(var6 < -var8) {
++			var6 = -var8;
++		}
++
++		if(var2 > var8) {
++			var2 = var8;
++		}
++
++		if(var4 > var8) {
++			var4 = var8;
++		}
++
++		if(var6 > var8) {
++			var6 = var8;
++		}
++
++		this.motionX = (int)(var2 * 8000.0D);
++		this.motionY = (int)(var4 * 8000.0D);
++		this.motionZ = (int)(var6 * 8000.0D);
++	}
++
++	public void readPacketData(DataInputStream var1) throws IOException {
++		this.entityId = var1.readInt();
++		this.motionX = var1.readShort();
++		this.motionY = var1.readShort();
++		this.motionZ = var1.readShort();
++	}
++
++	public void writePacket(DataOutputStream var1) throws IOException {
++		var1.writeInt(this.entityId);
++		var1.writeShort(this.motionX);
++		var1.writeShort(this.motionY);
++		var1.writeShort(this.motionZ);
++	}
++
++	public void processPacket(NetHandler var1) {
++		var1.handleEntityVelocity(this);
++	}
++
++	public int getPacketSize() {
++		return 10;
++	}
++}
+--- net/minecraft/src/NetHandler.java
++++ net/minecraft/src/NetHandler.java
+@@ -109,4 +109,32 @@
+ 	public void handleSpawnPosition(Packet6SpawnPosition var1) {
+ 		this.registerPacket(var1);
+ 	}
++
++	public void handleUseEntity(Packet7UseEntity var1) {
++		this.registerPacket(var1);
++	}
++
++	public void handleUpdateHealth(Packet8UpdateHealth var1) {
++		this.registerPacket(var1);
++	}
++
++	public void handleRespawn(Packet9Respawn var1) {
++		this.registerPacket(var1);
++	}
++
++	public void handleEntityVelocity(Packet28EntityVelocity var1) {
++		this.registerPacket(var1);
++	}
++
++	public void handleEntityStatus(Packet38EntityStatus var1) {
++		this.registerPacket(var1);
++	}
++
++	public void handleExplosion(Packet60Explosion var1) {
++		this.registerPacket(var1);
++	}
++
++	public void handleServerSetting(Packet70ServerSetting var1) {
++		this.registerPacket(var1);
++	}
+ }
+--- net/minecraft/src/ItemSnowball.java
++++ net/minecraft/src/ItemSnowball.java
+@@ -9,7 +9,10 @@
+ 	public ItemStack onItemRightClick(ItemStack var1, World var2, EntityPlayer var3) {
+ 		--var1.stackSize;
+ 		var2.playSoundAtEntity(var3, "random.bow", 0.5F, 0.4F / (rand.nextFloat() * 0.4F + 0.8F));
+-		var2.spawnEntityInWorld(new EntitySnowball(var2, var3));
++		if(!var2.multiplayerWorld) {
++			var2.spawnEntityInWorld(new EntitySnowball(var2, var3));
++		}
++
+ 		return var1;
+ 	}
+ }
+--- net/minecraft/src/EntitySheep.java
++++ net/minecraft/src/EntitySheep.java
+@@ -10,6 +10,10 @@
+ 	}
+ 
+ 	public boolean attackEntityFrom(Entity var1, int var2) {
++		if(this.worldObj.multiplayerWorld) {
++			return false;
++		}
++
+ 		if(!this.sheared && var1 instanceof EntityLiving) {
+ 			this.sheared = true;
+ 			int var3 = 1 + this.rand.nextInt(3);
+--- net/minecraft/src/BlockTNT.java
++++ net/minecraft/src/BlockTNT.java
+@@ -24,12 +24,20 @@
+ 	}
+ 
+ 	public void onBlockDestroyedByExplosion(World var1, int var2, int var3, int var4) {
++		if(var1.multiplayerWorld) {
++			return;
++		}
++
+ 		EntityTNTPrimed var5 = new EntityTNTPrimed(var1, (float)var2 + 0.5F, (float)var3 + 0.5F, (float)var4 + 0.5F);
+ 		var5.fuse = var1.rand.nextInt(var5.fuse / 4) + var5.fuse / 8;
+ 		var1.spawnEntityInWorld(var5);
+ 	}
+ 
+ 	public void onBlockDestroyedByPlayer(World var1, int var2, int var3, int var4, int var5) {
++		if(var1.multiplayerWorld) {
++			return;
++		}
++
+ 		EntityTNTPrimed var6 = new EntityTNTPrimed(var1, (float)var2 + 0.5F, (float)var3 + 0.5F, (float)var4 + 0.5F);
+ 		var1.spawnEntityInWorld(var6);
+ 		var1.playSoundAtEntity(var6, "random.fuse", 1.0F, 1.0F);
+--- net/minecraft/src/EntityTNTPrimed.java
++++ net/minecraft/src/EntityTNTPrimed.java
+@@ -45,8 +45,10 @@
+ 		}
+ 
+ 		if(this.fuse-- <= 0) {
+-			this.setEntityDead();
+-			this.explode();
++			if(!this.worldObj.multiplayerWorld) {
++				this.setEntityDead();
++				this.explode();
++			}
+ 		} else {
+ 			this.worldObj.spawnParticle("smoke", this.posX, this.posY + 0.5D, this.posZ, 0.0D, 0.0D, 0.0D);
+ 		}
+--- /dev/null
++++ net/minecraft/src/Packet70ServerSetting.java
+@@ -1,0 +1,37 @@
++package net.minecraft.src;
++
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++
++/** A server-wide setting the client should follow, e.g. "skins" = "off". */
++public class Packet70ServerSetting extends Packet {
++	public String key;
++	public String value;
++
++	public Packet70ServerSetting() {
++	}
++
++	public Packet70ServerSetting(String var1, String var2) {
++		this.key = var1;
++		this.value = var2;
++	}
++
++	public void readPacketData(DataInputStream var1) throws IOException {
++		this.key = var1.readUTF();
++		this.value = var1.readUTF();
++	}
++
++	public void writePacket(DataOutputStream var1) throws IOException {
++		var1.writeUTF(this.key);
++		var1.writeUTF(this.value);
++	}
++
++	public void processPacket(NetHandler var1) {
++		var1.handleServerSetting(this);
++	}
++
++	public int getPacketSize() {
++		return 4 + this.key.length() + this.value.length();
++	}
++}
+--- net/minecraft/src/TileEntityChest.java
++++ net/minecraft/src/TileEntityChest.java
+@@ -1,6 +1,7 @@
+ package net.minecraft.src;
+ 
+ public class TileEntityChest extends TileEntity implements IInventory {
++	private int syncRevision = 0;
+ 	private ItemStack[] chestContents = new ItemStack[36];
+ 
+ 	public int getSizeInventory() {
+@@ -48,6 +49,7 @@
+ 
+ 	public void readFromNBT(NBTTagCompound var1) {
+ 		super.readFromNBT(var1);
++		this.syncRevision = var1.getInteger("Rev");
+ 		NBTTagList var2 = var1.getTagList("Items");
+ 		this.chestContents = new ItemStack[this.getSizeInventory()];
+ 
+@@ -63,6 +65,7 @@
+ 
+ 	public void writeToNBT(NBTTagCompound var1) {
+ 		super.writeToNBT(var1);
++		var1.setInteger("Rev", this.syncRevision);
+ 		NBTTagList var2 = new NBTTagList();
+ 
+ 		for(int var3 = 0; var3 < this.chestContents.length; ++var3) {
+--- net/minecraft/src/ItemRenderer.java
++++ net/minecraft/src/ItemRenderer.java
+@@ -172,7 +172,7 @@
+ 			var8 = MathHelper.sin(MathHelper.sqrt_float(var6) * (float)Math.PI);
+ 			GL11.glRotatef(var8 * 70.0F, 0.0F, 1.0F, 0.0F);
+ 			GL11.glRotatef(-var7 * 20.0F, 0.0F, 0.0F, 1.0F);
+-			GL11.glBindTexture(GL11.GL_TEXTURE_2D, this.mc.renderEngine.getTextureForDownloadableImage(this.mc.thePlayer.skinUrl, this.mc.thePlayer.getTexture()));
++			GL11.glBindTexture(GL11.GL_TEXTURE_2D, this.mc.renderEngine.getTextureForDownloadableImage(this.mc.theWorld != null && this.mc.theWorld.skinsDisabled ? null : this.mc.thePlayer.skinUrl, this.mc.thePlayer.getTexture()));
+ 			GL11.glTranslatef(-1.0F, 3.6F, 3.5F);
+ 			GL11.glRotatef(120.0F, 0.0F, 0.0F, 1.0F);
+ 			GL11.glRotatef(200.0F, 1.0F, 0.0F, 0.0F);
+--- /dev/null
++++ net/minecraft/src/Packet8UpdateHealth.java
+@@ -1,0 +1,32 @@
++package net.minecraft.src;
++
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++
++public class Packet8UpdateHealth extends Packet {
++	public int healthMP;
++
++	public Packet8UpdateHealth() {
++	}
++
++	public Packet8UpdateHealth(int var1) {
++		this.healthMP = var1;
++	}
++
++	public void readPacketData(DataInputStream var1) throws IOException {
++		this.healthMP = var1.readShort();
++	}
++
++	public void writePacket(DataOutputStream var1) throws IOException {
++		var1.writeShort(this.healthMP);
++	}
++
++	public void processPacket(NetHandler var1) {
++		var1.handleUpdateHealth(this);
++	}
++
++	public int getPacketSize() {
++		return 2;
++	}
++}
+--- net/minecraft/src/EntityLiving.java
++++ net/minecraft/src/EntityLiving.java
+@@ -283,6 +283,10 @@
+ 	}
+ 
+ 	public void heal(int var1) {
++		if(this.worldObj.multiplayerWorld) {
++			return;
++		}
++
+ 		if(this.health > 0) {
+ 			this.health += var1;
+ 			if(this.health > 20) {
+@@ -295,7 +299,7 @@
+ 
+ 	public boolean attackEntityFrom(Entity var1, int var2) {
+ 		if(this.worldObj.multiplayerWorld) {
+-			var2 = 0;
++			return false;
+ 		}
+ 
+ 		this.entityAge = 0;
+@@ -340,6 +344,20 @@
+ 
+ 			return true;
+ 		}
++	}
++
++	public void handleHealthUpdate(byte var1) {
++		if(var1 == 2) {
++			this.limbYaw = 1.5F;
++			this.heartsLife = this.heartsHalvesLife;
++			this.hurtTime = this.maxHurtTime = 10;
++			this.attackedAtYaw = 0.0F;
++			this.worldObj.playSoundAtEntity(this, this.getHurtSound(), this.getSoundVolume(), (this.rand.nextFloat() - this.rand.nextFloat()) * 0.2F + 1.0F);
++		} else if(var1 == 3) {
++			this.worldObj.playSoundAtEntity(this, this.getDeathSound(), this.getSoundVolume(), (this.rand.nextFloat() - this.rand.nextFloat()) * 0.2F + 1.0F);
++			this.health = 0;
++		}
++
+ 	}
+ 
+ 	protected float getSoundVolume() {
+--- /dev/null
++++ net/minecraft/src/Packet7UseEntity.java
+@@ -1,0 +1,40 @@
++package net.minecraft.src;
++
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++
++public class Packet7UseEntity extends Packet {
++	public int playerEntityId;
++	public int targetEntity;
++	public byte isLeftClick;
++
++	public Packet7UseEntity() {
++	}
++
++	public Packet7UseEntity(int var1, int var2, int var3) {
++		this.playerEntityId = var1;
++		this.targetEntity = var2;
++		this.isLeftClick = (byte)var3;
++	}
++
++	public void readPacketData(DataInputStream var1) throws IOException {
++		this.playerEntityId = var1.readInt();
++		this.targetEntity = var1.readInt();
++		this.isLeftClick = var1.readByte();
++	}
++
++	public void writePacket(DataOutputStream var1) throws IOException {
++		var1.writeInt(this.playerEntityId);
++		var1.writeInt(this.targetEntity);
++		var1.writeByte(this.isLeftClick);
++	}
++
++	public void processPacket(NetHandler var1) {
++		var1.handleUseEntity(this);
++	}
++
++	public int getPacketSize() {
++		return 9;
++	}
++}
+--- /dev/null
++++ net/minecraft/src/Packet38EntityStatus.java
+@@ -1,0 +1,36 @@
++package net.minecraft.src;
++
++import java.io.DataInputStream;
++import java.io.DataOutputStream;
++import java.io.IOException;
++
++public class Packet38EntityStatus extends Packet {
++	public int entityId;
++	public byte entityStatus;
++
++	public Packet38EntityStatus() {
++	}
++
++	public Packet38EntityStatus(int var1, byte var2) {
++		this.entityId = var1;
++		this.entityStatus = var2;
++	}
++
++	public void readPacketData(DataInputStream var1) throws IOException {
++		this.entityId = var1.readInt();
++		this.entityStatus = var1.readByte();
++	}
++
++	public void writePacket(DataOutputStream var1) throws IOException {
++		var1.writeInt(this.entityId);
++		var1.writeByte(this.entityStatus);
++	}
++
++	public void processPacket(NetHandler var1) {
++		var1.handleEntityStatus(this);
++	}
++
++	public int getPacketSize() {
++		return 5;
++	}
++}
